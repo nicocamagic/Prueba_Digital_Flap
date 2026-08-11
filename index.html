@@ -223,12 +223,19 @@ function App() {
   const glStateRef = useRef(null);
   const smoothQuadRef = useRef(null); // esquinas suavizadas (EMA) en px de la cámara
   const missedFramesRef = useRef(0);
+  const motionCanvasRef = useRef(document.createElement("canvas"));
+  const prevGrayFrameRef = useRef(null);
+  const lastTriggerRef = useRef(0);
 
   useEffect(() => {
     texturesRef.current = {
       A: makeTexture("A", "#B71C1C"),
       B: makeTexture("B", "#0D47A1"),
     };
+    // Canvas chico y fijo solo para medir movimiento (pasada de mano), no
+    // necesita resolución real — más chico = más rápido de procesar.
+    motionCanvasRef.current.width = 64;
+    motionCanvasRef.current.height = 48;
 
     let stream, raf, cvReady = false;
 
@@ -282,12 +289,46 @@ function App() {
       }
     }
 
+    // Detecta una "pasada de mano" comparando el brillo promedio entre
+    // cuadros consecutivos de un canvas chico (64x48). Cuando una mano pasa
+    // cerca de la cámara, el brillo cambia mucho y rápido — eso es el gatillo.
+    // No usa OpenCV, así que funciona aunque cv todavía no haya cargado.
+    const WAVE_THRESHOLD = 28;      // 0-255: qué tan grande debe ser el cambio de brillo
+    const WAVE_COOLDOWN_MS = 800;   // evita que una sola pasada dispare el cambio varias veces
+
+    function detectWaveAndMaybeTrigger(v) {
+      const mc = motionCanvasRef.current;
+      const mctx = mc.getContext("2d", { willReadFrequently: true });
+      mctx.drawImage(v, 0, 0, mc.width, mc.height);
+      const frame = mctx.getImageData(0, 0, mc.width, mc.height).data;
+
+      const gray = new Uint8ClampedArray(mc.width * mc.height);
+      for (let i = 0, p = 0; i < frame.length; i += 4, p++) {
+        gray[p] = (frame[i] + frame[i + 1] + frame[i + 2]) / 3;
+      }
+
+      if (prevGrayFrameRef.current) {
+        let diffSum = 0;
+        for (let p = 0; p < gray.length; p++) {
+          diffSum += Math.abs(gray[p] - prevGrayFrameRef.current[p]);
+        }
+        const avgDiff = diffSum / gray.length;
+        const now = performance.now();
+        if (avgDiff > WAVE_THRESHOLD && now - lastTriggerRef.current > WAVE_COOLDOWN_MS) {
+          lastTriggerRef.current = now;
+          activeTexRef.current = !activeTexRef.current;
+        }
+      }
+      prevGrayFrameRef.current = gray;
+    }
+
     const SMOOTHING_ALPHA = 0.35; // más bajo = más suave pero más "lag"; más alto = más reactivo pero tiembla más
     const MAX_MISSED_FRAMES = 6;  // cuántos cuadros sin detección toleramos antes de ocultar el overlay
 
     function loop() {
       const v = videoRef.current;
       ensureCanvasesMatchVideo();
+      detectWaveAndMaybeTrigger(v);
 
       const work = workCanvasRef.current;
       const wctx = work.getContext("2d", { willReadFrequently: true });
@@ -340,6 +381,8 @@ function App() {
     };
   }, []);
 
+  // Disparador manual de respaldo — el principal ahora es la pasada de mano
+  // detectada en detectWaveAndMaybeTrigger(). Útil para probar sin gesto.
   const toggleTexture = () => { activeTexRef.current = !activeTexRef.current; };
 
   return h(Fragment, null,
