@@ -12,25 +12,21 @@
   #status { position:absolute; top:16px; left:16px; color:#fff; font:12px monospace;
             background:rgba(0,0,0,0.4); padding:4px 8px; border-radius:4px; z-index:5; }
   #trigger { position:absolute; bottom:8px; right:8px; width:90px; height:90px; z-index:6; }
-  #loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-             color:#fff; font:14px sans-serif; background:#000; z-index:10; text-align:center; padding:20px; }
 </style>
 </head>
 <body>
 <div id="root"></div>
 
-<!-- React + Babel standalone, sin build step -->
+<!-- React sin Babel: nada de JSX, así no hace falta transformar nada en el navegador -->
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
 <!-- OpenCV.js: solo lo usamos para detectar el cuadrilátero de la carta -->
 <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 
-<script type="text/babel" data-presets="react">
-const { useEffect, useRef, useState } = React;
+<script>
+const { useEffect, useRef, useState, createElement: h, Fragment } = React;
 
 // ---------- Homografía (DLT de 4 puntos) ----------
-// Mapea 4 puntos origen -> 4 puntos destino. Devuelve matriz 3x3 (array de 9, row-major).
 function computeHomography(src, dst) {
   const A = [];
   for (let i = 0; i < 4; i++) {
@@ -39,12 +35,10 @@ function computeHomography(src, dst) {
     A.push([x, y, 1, 0, 0, 0, -X * x, -X * y, -X]);
     A.push([0, 0, 0, x, y, 1, -Y * x, -Y * y, -Y]);
   }
-  // Resolver A*h = 0 vía eliminación gaussiana fijando h[8] = 1
-  // Reordenamos como sistema 8x8 (dejamos afuera la col 8 y resolvemos para h0..h7, con h8=1)
   const M = A.map(row => row.slice(0, 8).concat([-row[8]]));
-  const h = gaussianSolve(M);
-  h.push(1);
-  return h; // [h0..h8] row-major 3x3
+  const hVec = gaussianSolve(M);
+  hVec.push(1);
+  return hVec; // [h0..h8] row-major 3x3
 }
 
 function gaussianSolve(M) {
@@ -67,8 +61,6 @@ function gaussianSolve(M) {
 }
 
 // ---------- Detección del cuadrilátero (OpenCV.js) ----------
-// Misma lógica que la versión Kotlin: Canny + contornos + approxPolyDP,
-// nos quedamos con el contorno de 4 puntos más grande.
 function findCardQuad(cv, srcMat) {
   const gray = new cv.Mat();
   cv.cvtColor(srcMat, gray, cv.COLOR_RGBA2GRAY);
@@ -134,7 +126,7 @@ function makeTexture(label, color) {
 
 // ---------- WebGL: quad texturizado con warp proyectivo real ----------
 const VS = `
-  attribute vec3 aPosXYW;   // xy en NDC ya multiplicados por w, w = componente homogénea
+  attribute vec3 aPosXYW;
   attribute vec2 aTexCoord;
   varying vec2 vTexCoord;
   void main() {
@@ -182,19 +174,16 @@ function initGL(gl) {
   return { prog, posBuf, aPos, texture };
 }
 
-// Dibuja `textureCanvas` warpeado sobre el quad [tl,tr,br,bl] (en px de pantalla).
 function drawWarpedQuad(gl, glState, textureCanvas, quadPx, canvasW, canvasH) {
   gl.viewport(0, 0, canvasW, canvasH);
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
   if (!quadPx) return;
 
-  // Homografía: cuadrado unidad -> quad en NDC
   const toNdc = ([x, y]) => [(x / canvasW) * 2 - 1, 1 - (y / canvasH) * 2];
   const dstNdc = quadPx.map(toNdc);
   const H = computeHomography([[0,0],[1,0],[1,1],[0,1]], dstNdc);
 
-  // Para cada esquina del cuadrado unidad, [x,y,w] = H * [u,v,1]
   const corners = [[0,0],[1,0],[1,1],[0,1]];
   const xyw = corners.map(([u, v]) => {
     const x = H[0]*u + H[1]*v + H[2];
@@ -202,7 +191,6 @@ function drawWarpedQuad(gl, glState, textureCanvas, quadPx, canvasW, canvasH) {
     const w = H[6]*u + H[7]*v + H[8];
     return [x, y, w];
   });
-  // 2 triángulos: 0,1,2 y 0,2,3
   const order = [0,1,2, 0,2,3];
   const posData = new Float32Array(order.length * 3);
   order.forEach((idx, i) => {
@@ -224,13 +212,13 @@ function drawWarpedQuad(gl, glState, textureCanvas, quadPx, canvasW, canvasH) {
   gl.drawArrays(gl.TRIANGLES, 0, 6);
 }
 
-// ---------- App ----------
+// ---------- App (sin JSX) ----------
 function App() {
   const videoRef = useRef(null);
   const glCanvasRef = useRef(null);
   const workCanvasRef = useRef(document.createElement("canvas"));
   const [status, setStatus] = useState("cargando OpenCV...");
-  const activeTexRef = useRef(true); // true = A, false = B
+  const activeTexRef = useRef(true);
   const texturesRef = useRef(null);
   const glStateRef = useRef(null);
 
@@ -272,7 +260,7 @@ function App() {
       const gl = glCanvasRef.current.getContext("webgl", { alpha: true });
       glCanvasRef.current.width = v.videoWidth;
       glCanvasRef.current.height = v.videoHeight;
-      glStateRef.current = { gl, ...initGL(gl) };
+      glStateRef.current = Object.assign({ gl }, initGL(gl));
 
       const work = workCanvasRef.current;
       const scale = Math.min(1, 480 / v.videoWidth);
@@ -317,17 +305,15 @@ function App() {
 
   const toggleTexture = () => { activeTexRef.current = !activeTexRef.current; };
 
-  return (
-    <React.Fragment>
-      <video ref={videoRef} playsInline muted />
-      <canvas id="glCanvas" ref={glCanvasRef} />
-      <div id="status">{status}</div>
-      <div id="trigger" onClick={toggleTexture}></div>
-    </React.Fragment>
+  return h(Fragment, null,
+    h("video", { ref: videoRef, playsInline: true, muted: true }),
+    h("canvas", { id: "glCanvas", ref: glCanvasRef }),
+    h("div", { id: "status" }, status),
+    h("div", { id: "trigger", onClick: toggleTexture })
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+ReactDOM.createRoot(document.getElementById("root")).render(h(App));
 </script>
 </body>
 </html>
