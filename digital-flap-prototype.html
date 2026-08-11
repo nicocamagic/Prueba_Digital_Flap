@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<title>Digital Flap — prototipo web</title>
+<style>
+  html, body { margin:0; padding:0; background:#000; overflow:hidden; height:100%; width:100%; }
+  #root { position:relative; width:100vw; height:100vh; }
+  video, canvas { position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }
+  #glCanvas { pointer-events:none; }
+  #status { position:absolute; top:16px; left:16px; color:#fff; font:12px monospace;
+            background:rgba(0,0,0,0.4); padding:4px 8px; border-radius:4px; z-index:5; }
+  #trigger { position:absolute; bottom:8px; right:8px; width:90px; height:90px; z-index:6; }
+  #loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+             color:#fff; font:14px sans-serif; background:#000; z-index:10; text-align:center; padding:20px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React + Babel standalone, sin build step -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<!-- OpenCV.js: solo lo usamos para detectar el cuadrilátero de la carta -->
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useEffect, useRef, useState } = React;
+
+// ---------- Homografía (DLT de 4 puntos) ----------
+// Mapea 4 puntos origen -> 4 puntos destino. Devuelve matriz 3x3 (array de 9, row-major).
+function computeHomography(src, dst) {
+  const A = [];
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = src[i];
+    const [X, Y] = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -X * x, -X * y, -X]);
+    A.push([0, 0, 0, x, y, 1, -Y * x, -Y * y, -Y]);
+  }
+  // Resolver A*h = 0 vía eliminación gaussiana fijando h[8] = 1
+  // Reordenamos como sistema 8x8 (dejamos afuera la col 8 y resolvemos para h0..h7, con h8=1)
+  const M = A.map(row => row.slice(0, 8).concat([-row[8]]));
+  const h = gaussianSolve(M);
+  h.push(1);
+  return h; // [h0..h8] row-major 3x3
+}
+
+function gaussianSolve(M) {
+  const n = 8;
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let row = col + 1; row < n; row++) {
+      if (Math.abs(M[row][col]) > Math.abs(M[pivot][col])) pivot = row;
+    }
+    [M[col], M[pivot]] = [M[pivot], M[col]];
+    const pv = M[col][col] || 1e-9;
+    for (let k = col; k <= n; k++) M[col][k] /= pv;
+    for (let row = 0; row < n; row++) {
+      if (row === col) continue;
+      const factor = M[row][col];
+      for (let k = col; k <= n; k++) M[row][k] -= factor * M[col][k];
+    }
+  }
+  return M.map(row => row[n]);
+}
+
+// ---------- Detección del cuadrilátero (OpenCV.js) ----------
+// Misma lógica que la versión Kotlin: Canny + contornos + approxPolyDP,
+// nos quedamos con el contorno de 4 puntos más grande.
+function findCardQuad(cv, srcMat) {
+  const gray = new cv.Mat();
+  cv.cvtColor(srcMat, gray, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
+  const edges = new cv.Mat();
+  cv.Canny(gray, edges, 50, 150);
+  cv.dilate(edges, edges, cv.Mat.ones(3, 3, cv.CV_8U));
+
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  const frameArea = srcMat.rows * srcMat.cols;
+  let best = null, bestArea = 0;
+
+  for (let i = 0; i < contours.size(); i++) {
+    const cnt = contours.get(i);
+    const area = cv.contourArea(cnt);
+    if (area < frameArea * 0.05) { cnt.delete(); continue; }
+    const peri = cv.arcLength(cnt, true);
+    const approx = new cv.Mat();
+    cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+    if (approx.rows === 4 && area > bestArea) {
+      bestArea = area;
+      const pts = [];
+      for (let p = 0; p < 4; p++) pts.push([approx.data32S[p * 2], approx.data32S[p * 2 + 1]]);
+      best = orderPoints(pts);
+    }
+    approx.delete();
+    cnt.delete();
+  }
+
+  gray.delete(); edges.delete(); contours.delete(); hierarchy.delete();
+  return best;
+}
+
+function orderPoints(pts) {
+  const bySum = [...pts].sort((a, b) => (a[0] + a[1]) - (b[0] + b[1]));
+  const byDiff = [...pts].sort((a, b) => (a[1] - a[0]) - (b[1] - b[0]));
+  const topLeft = bySum[0], bottomRight = bySum[3];
+  const topRight = byDiff[0], bottomLeft = byDiff[3];
+  return [topLeft, topRight, bottomRight, bottomLeft];
+}
+
+// ---------- Textura placeholder (canvas 2D -> textura WebGL) ----------
+function makeTexture(label, color) {
+  const c = document.createElement("canvas");
+  c.width = 300; c.height = 420;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.roundRect(4, 4, 292, 412, 24);
+  ctx.fill();
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 6;
+  ctx.stroke();
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 64px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(label, 150, 230);
+  return c;
+}
+
+// ---------- WebGL: quad texturizado con warp proyectivo real ----------
+const VS = `
+  attribute vec3 aPosXYW;   // xy en NDC ya multiplicados por w, w = componente homogénea
+  attribute vec2 aTexCoord;
+  varying vec2 vTexCoord;
+  void main() {
+    vTexCoord = aTexCoord;
+    gl_Position = vec4(aPosXYW.x, aPosXYW.y, 0.0, aPosXYW.z);
+  }
+`;
+const FS = `
+  precision mediump float;
+  varying vec2 vTexCoord;
+  uniform sampler2D uTexture;
+  void main() {
+    gl_FragColor = texture2D(uTexture, vTexCoord);
+  }
+`;
+
+function initGL(gl) {
+  function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    return s;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+
+  const posBuf = gl.createBuffer();
+  const texBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, texBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 1,1, 0,0, 1,1, 0,1]), gl.STATIC_DRAW);
+  const aTex = gl.getAttribLocation(prog, "aTexCoord");
+  gl.enableVertexAttribArray(aTex);
+  gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 0, 0);
+
+  const aPos = gl.getAttribLocation(prog, "aPosXYW");
+  const texture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  return { prog, posBuf, aPos, texture };
+}
+
+// Dibuja `textureCanvas` warpeado sobre el quad [tl,tr,br,bl] (en px de pantalla).
+function drawWarpedQuad(gl, glState, textureCanvas, quadPx, canvasW, canvasH) {
+  gl.viewport(0, 0, canvasW, canvasH);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!quadPx) return;
+
+  // Homografía: cuadrado unidad -> quad en NDC
+  const toNdc = ([x, y]) => [(x / canvasW) * 2 - 1, 1 - (y / canvasH) * 2];
+  const dstNdc = quadPx.map(toNdc);
+  const H = computeHomography([[0,0],[1,0],[1,1],[0,1]], dstNdc);
+
+  // Para cada esquina del cuadrado unidad, [x,y,w] = H * [u,v,1]
+  const corners = [[0,0],[1,0],[1,1],[0,1]];
+  const xyw = corners.map(([u, v]) => {
+    const x = H[0]*u + H[1]*v + H[2];
+    const y = H[3]*u + H[4]*v + H[5];
+    const w = H[6]*u + H[7]*v + H[8];
+    return [x, y, w];
+  });
+  // 2 triángulos: 0,1,2 y 0,2,3
+  const order = [0,1,2, 0,2,3];
+  const posData = new Float32Array(order.length * 3);
+  order.forEach((idx, i) => {
+    posData[i*3] = xyw[idx][0];
+    posData[i*3+1] = xyw[idx][1];
+    posData[i*3+2] = xyw[idx][2];
+  });
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, glState.posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, posData, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(glState.aPos);
+  gl.vertexAttribPointer(glState.aPos, 3, gl.FLOAT, false, 0, 0);
+
+  gl.bindTexture(gl.TEXTURE_2D, glState.texture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textureCanvas);
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+// ---------- App ----------
+function App() {
+  const videoRef = useRef(null);
+  const glCanvasRef = useRef(null);
+  const workCanvasRef = useRef(document.createElement("canvas"));
+  const [status, setStatus] = useState("cargando OpenCV...");
+  const activeTexRef = useRef(true); // true = A, false = B
+  const texturesRef = useRef(null);
+  const glStateRef = useRef(null);
+
+  useEffect(() => {
+    texturesRef.current = {
+      A: makeTexture("A", "#B71C1C"),
+      B: makeTexture("B", "#0D47A1"),
+    };
+
+    let stream, raf, cvReady = false;
+
+    function waitForCv() {
+      if (window.cv && window.cv.Mat) {
+        cvReady = true;
+        setStatus("buscando carta...");
+        startCamera();
+      } else {
+        setTimeout(waitForCv, 200);
+      }
+    }
+
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false,
+        });
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+        setupCanvases();
+        raf = requestAnimationFrame(loop);
+      } catch (e) {
+        setStatus("error de cámara: " + e.message);
+      }
+    }
+
+    function setupCanvases() {
+      const v = videoRef.current;
+      const gl = glCanvasRef.current.getContext("webgl", { alpha: true });
+      glCanvasRef.current.width = v.videoWidth;
+      glCanvasRef.current.height = v.videoHeight;
+      glStateRef.current = { gl, ...initGL(gl) };
+
+      const work = workCanvasRef.current;
+      const scale = Math.min(1, 480 / v.videoWidth);
+      work.width = Math.round(v.videoWidth * scale);
+      work.height = Math.round(v.videoHeight * scale);
+    }
+
+    function loop() {
+      const v = videoRef.current;
+      const work = workCanvasRef.current;
+      const wctx = work.getContext("2d");
+      wctx.drawImage(v, 0, 0, work.width, work.height);
+
+      if (cvReady) {
+        const cv = window.cv;
+        const src = cv.imread(work);
+        const quad = findCardQuad(cv, src);
+        src.delete();
+
+        const gl = glStateRef.current.gl;
+        if (quad) {
+          setStatus("carta detectada");
+          const scaleX = v.videoWidth / work.width;
+          const scaleY = v.videoHeight / work.height;
+          const quadPx = quad.map(([x, y]) => [x * scaleX, y * scaleY]);
+          const tex = activeTexRef.current ? texturesRef.current.A : texturesRef.current.B;
+          drawWarpedQuad(gl, glStateRef.current, tex, quadPx, v.videoWidth, v.videoHeight);
+        } else {
+          setStatus("buscando carta...");
+          drawWarpedQuad(gl, glStateRef.current, null, null, v.videoWidth, v.videoHeight);
+        }
+      }
+      raf = requestAnimationFrame(loop);
+    }
+
+    waitForCv();
+    return () => {
+      cancelAnimationFrame(raf);
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    };
+  }, []);
+
+  const toggleTexture = () => { activeTexRef.current = !activeTexRef.current; };
+
+  return (
+    <React.Fragment>
+      <video ref={videoRef} playsInline muted />
+      <canvas id="glCanvas" ref={glCanvasRef} />
+      <div id="status">{status}</div>
+      <div id="trigger" onClick={toggleTexture}></div>
+    </React.Fragment>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
