@@ -361,7 +361,7 @@ function App() {
       prevGrayFrameRef.current = gray;
     }
 
-    const SMOOTHING_ALPHA = 0.35; // más bajo = más suave pero más "lag"; más alto = más reactivo pero tiembla más
+    const SMOOTHING_ALPHA = 1.00; // más bajo = más suave pero más "lag"; más alto = más reactivo pero tiembla más
     const MAX_MISSED_FRAMES = 6;  // cuántos cuadros sin detección toleramos antes de ocultar el overlay
 
     function loop() {
