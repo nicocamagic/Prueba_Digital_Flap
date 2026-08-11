@@ -271,7 +271,7 @@ function App() {
     function loop() {
       const v = videoRef.current;
       const work = workCanvasRef.current;
-      const wctx = work.getContext("2d");
+      const wctx = work.getContext("2d", { willReadFrequently: true });
       wctx.drawImage(v, 0, 0, work.width, work.height);
 
       if (cvReady) {
