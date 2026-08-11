@@ -221,6 +221,8 @@ function App() {
   const activeTexRef = useRef(true);
   const texturesRef = useRef(null);
   const glStateRef = useRef(null);
+  const smoothQuadRef = useRef(null); // esquinas suavizadas (EMA) en px de la cámara
+  const missedFramesRef = useRef(0);
 
   useEffect(() => {
     texturesRef.current = {
@@ -268,8 +270,25 @@ function App() {
       work.height = Math.round(v.videoHeight * scale);
     }
 
+    // Si videoWidth/Height todavía no estaban listos cuando se llamó
+    // setupCanvases() (pasa en algunos navegadores justo después de play()),
+    // el canvas queda con una resolución vieja/0 y todo el overlay se
+    // desalinea de forma fija. Esto lo detecta y corrige solo.
+    function ensureCanvasesMatchVideo() {
+      const v = videoRef.current;
+      if (v.videoWidth && glCanvasRef.current.width !== v.videoWidth) {
+        setupCanvases();
+        smoothQuadRef.current = null;
+      }
+    }
+
+    const SMOOTHING_ALPHA = 0.35; // más bajo = más suave pero más "lag"; más alto = más reactivo pero tiembla más
+    const MAX_MISSED_FRAMES = 6;  // cuántos cuadros sin detección toleramos antes de ocultar el overlay
+
     function loop() {
       const v = videoRef.current;
+      ensureCanvasesMatchVideo();
+
       const work = workCanvasRef.current;
       const wctx = work.getContext("2d", { willReadFrequently: true });
       wctx.drawImage(v, 0, 0, work.width, work.height);
@@ -277,21 +296,39 @@ function App() {
       if (cvReady) {
         const cv = window.cv;
         const src = cv.imread(work);
-        const quad = findCardQuad(cv, src);
+        const rawQuad = findCardQuad(cv, src);
         src.delete();
 
         const gl = glStateRef.current.gl;
-        if (quad) {
-          setStatus("carta detectada");
+
+        if (rawQuad) {
+          missedFramesRef.current = 0;
           const scaleX = v.videoWidth / work.width;
           const scaleY = v.videoHeight / work.height;
-          const quadPx = quad.map(([x, y]) => [x * scaleX, y * scaleY]);
-          const tex = activeTexRef.current ? texturesRef.current.A : texturesRef.current.B;
-          drawWarpedQuad(gl, glStateRef.current, tex, quadPx, v.videoWidth, v.videoHeight);
+          const quadPx = rawQuad.map(([x, y]) => [x * scaleX, y * scaleY]);
+
+          if (!smoothQuadRef.current) {
+            smoothQuadRef.current = quadPx;
+          } else {
+            smoothQuadRef.current = smoothQuadRef.current.map(([sx, sy], i) => {
+              const [nx, ny] = quadPx[i];
+              return [
+                sx + (nx - sx) * SMOOTHING_ALPHA,
+                sy + (ny - sy) * SMOOTHING_ALPHA,
+              ];
+            });
+          }
+          setStatus("carta detectada");
         } else {
-          setStatus("buscando carta...");
-          drawWarpedQuad(gl, glStateRef.current, null, null, v.videoWidth, v.videoHeight);
+          missedFramesRef.current++;
+          if (missedFramesRef.current > MAX_MISSED_FRAMES) {
+            smoothQuadRef.current = null;
+            setStatus("buscando carta...");
+          }
         }
+
+        const tex = activeTexRef.current ? texturesRef.current.A : texturesRef.current.B;
+        drawWarpedQuad(gl, glStateRef.current, tex, smoothQuadRef.current, v.videoWidth, v.videoHeight);
       }
       raf = requestAnimationFrame(loop);
     }
